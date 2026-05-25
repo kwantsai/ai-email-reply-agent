@@ -1,14 +1,18 @@
 // =============================================================================
-// AI EMAIL REPLY AGENT — MAIN SCRIPT
+// AI EMAIL REPLY AGENT — MAIN SCRIPT  v2.0
 //
 // SETUP (once):
 //   1. Script Properties: ANTHROPIC_KEY, OPENAI_KEY
 //   2. Set CFG.dateFloor to your go-live date (e.g. 'after:2025/01/01')
-//   3. Run setupTrigger() to install the 5-minute trigger
+//   3. Set CFG.forwardingAddress if you want filing forwards (optional)
+//   4. Run setupTrigger() to install the 5-minute trigger
 //
 // TO TUNE RULES:
-//   - Run runRulesScan() in learning_scan.gs → paste output into KNOWN_LABEL_SENDER_MAP below
+//   - Run runRulesScan() in learning_scan.gs → paste output into KNOWN_LABEL_SENDER_MAP
+//     and NEVER_FILE_DOMAINS below (replaces the current values)
+//   - Run runLearningScan() in learning_scan.gs → paste output into STYLE_PROFILE
 //   - Edit LABEL_NOTES for edge cases the domain map can't cover
+//   - Edit FILING_SENDER_MAP / FILING_SUBJECT_PATTERNS for filing forwards
 //
 // TO REPROCESS A THREAD: remove the 'ai' label from it.
 // =============================================================================
@@ -24,6 +28,88 @@ const KNOWN_LABEL_SENDER_MAP = {
   // 'example.com': 2,   // always FYI
   // 'partner.com': 1,   // always needs reply
 };
+
+
+// ── NEVER FILE DOMAINS — paste output of runRulesScan() here ─────────────────
+// Domains that must never trigger a filing forward, even if the subject matches.
+// Run runRulesScan() to auto-generate from your history, or edit manually.
+
+const NEVER_FILE_DOMAINS = [
+  // --- Property portals ---
+  'zoopla.co.uk',
+  'rightmove.co.uk',
+  'onthemarket.com',
+
+  // --- Retail ---
+  'amazon.com',
+  'amazon.co.uk',
+  'ebay.com',
+  'asos.com',
+  'wayfair.com',
+  'etsy.com',
+
+  // --- Travel & Accommodation ---
+  'airbnb.com',
+  'booking.com',
+  'expedia.com',
+  'tripadvisor.com',
+  'kayak.com',
+
+  // --- Banking & Finance ---
+  'paypal.com',
+  'stripe.com',
+  'revolut.com',
+  'wise.com',
+  'monzo.com',
+  'n26.com',
+
+  // --- Google & Platforms ---
+  'google.com',
+  'youtube.com',
+  'linkedin.com',
+  'twitter.com',
+  'reddit.com',
+  'facebook.com',
+
+  // --- Marketing & Newsletters ---
+  'mailchimp.com',
+  'substack.com',
+  'medium.com',
+  'beehiiv.com',
+
+  // --- Education ---
+  'coursera.org',
+  'udemy.com',
+  'skillshare.com',
+
+  // --- Software & SaaS ---
+  'github.com',
+  'notion.so',
+  'slack.com',
+  'dropbox.com',
+  'zoom.us',
+];
+
+
+// ── FILING SENDER MAP — domains that always trigger a filing forward ──────────
+// Run deriveFilingSenderMap_() in learning_scan.gs to populate from history.
+// Only takes effect if CFG.forwardingAddress is set.
+
+const FILING_SENDER_MAP = {
+  // 'youragent.com':      'filing',
+  // 'youraccountant.com': 'filing',
+};
+
+const FILING_SUBJECT_PATTERNS = [
+  { match: 'statement',                   keyword: 'filing' },
+  { match: 'invoice',                     keyword: 'filing' },
+  { match: 'INV-',                        keyword: 'filing' },
+  { match: 'e-bill',                      keyword: 'filing' },
+  { match: 'you signed',                  keyword: 'filing' },
+  { match: 'confirmation of instruction', keyword: 'filing' },
+  { match: 'insurance documentation',     keyword: 'filing' },
+  // Add your own subject patterns here
+];
 
 
 // ── LABEL DEFINITIONS — LLM fallback for unknown senders ─────────────────────
@@ -51,110 +137,30 @@ const LABEL_NOTES =
   '"1: to respond" if they implicitly invite a reaction or contain an open question directed at ' +
   'you; otherwise "2: FYI".\n' +
   'Rule 4: Emails forwarded by a trusted contact with a brief personal note are "1: to respond" ' +
-  'because the forwarder is soliciting your decision, even if the core content is an update.';
+  'because the forwarder is soliciting your decision, even if the core content is an update.\n' +
+  'Rule 5: Emails where you are only CC\'d on an exchange between other parties, and the content ' +
+  'does not explicitly ask for your input, are "2: FYI".';
 
 
 // ── STYLE PROFILE — used by the Sonnet reply drafter ─────────────────────────
-// Replace this block by running runLearningScan() in learning_scan.gs.
-// It derives your personal writing style from your sent mail history.
+// Run runLearningScan() in learning_scan.gs and paste the output here.
+// The scan analyses your sent mail and produces this profile automatically.
 
-const STYLE_PROFILE = `=== STYLE PROFILE ===
-
-Overall Voice & Register
-- Businesslike but not stiff; direct and efficient with a warm undercurrent
-- Writes like a busy professional who respects the recipient's time and their own
-- Register shifts clearly by context: clipped and transactional with staff, measured and formal with solicitors, collegial with partners, politely assertive when disputing fees
-
-Greeting & Sign-off Patterns
-- Standard opening: "Hi [First name],"
-- Formal contexts: "Dear [Full name/Title],"
-- Sign-off with staff: "Thanks" or no sign-off
-- Sign-off with business contacts: "Thanks\n[Your name]"
-- Sign-off in formal letters: "Kind regards,\n[Your name]"
-
-Sentence & Paragraph Structure
-- Short sentences; avoids complex compound constructions
-- Uses numbered or bulleted lists for multi-point messages
-- Paragraphs are often a single sentence
-- No filler openers ("I hope this email finds you well")
-
-Characteristic Phrases
-- "Thanks for this." — common acknowledgement opener
-- "Can you confirm…" / "Could you confirm…" — frequent request form
-- "Just following up on…" — for nudging non-responders
-- "Happy to proceed" / "Happy to confirm" — signals agreement
-- "Noted." — minimalist acknowledgement
-
-=== FEW-SHOT EXAMPLES ===
-
-[Example 1 — Staff: task instruction]
-Please chase this up and let me know.
-
-Thanks
-
----
-
-[Example 2 — Business partner: short confirmation]
-Hi Alex,
-
-Yes, happy to proceed on that basis.
-
-Can you sort the paperwork and let me know once it's done?
-
-Thanks
-[Your name]
-
----
-
-[Example 3 — Service provider: approval with a question]
-Hi Sam,
-
-Thanks for sending this over.
-
-Happy to proceed with option 2.
-
-Could you confirm the start date and let me know once it's booked in?
-
-Thanks
-[Your name]
-
----
-
-[Example 4 — Formal / legal]
-Dear [Full Name],
-
-I hope this email finds you well.
-
-Could you kindly confirm whether you are the appropriate person to deal with this matter?
-
-Kind regards,
-[Your full name]
-
----
-
-[Example 5 — Service provider: dispute, polite but firm]
-Hi [Name],
-
-Thank you for this.
-
-I do not dispute the [amount] fee and have transferred it to your account.
-
-I ask you kindly to adjust the invoice accordingly.
-
-Thank you
-[Your name]`;
+const STYLE_PROFILE = `Paste the output of runLearningScan() here.`;
 
 
 // ── CONFIG — tune these numbers, not the logic ───────────────────────────────
 
 const CFG = {
-  dateFloor:         'newer_than:30d',   // change to 'after:YYYY/MM/DD' for a fixed go-live date
-  draftsPerRunCap:   2,                  // max reply drafts per 5-min run
-  processedLabel:    'ai',
-  openaiModel:       'gpt-4.1-nano',
-  anthropicModel:    'claude-sonnet-4-6',
-  threadContextMsgs: 15,
-  sentLookbackDays:  7,
+  dateFloor:            'newer_than:30d',   // change to 'after:YYYY/MM/DD' for a fixed go-live date
+  draftsPerRunCap:      2,                  // max reply drafts per 5-min run
+  chaseDraftsPerRunCap: 2,                  // max chase drafts per 5-min run
+  forwardingAddress:    '',                 // set to your filing address to enable filing forwards
+  processedLabel:       'ai',
+  openaiModel:          'gpt-4.1-nano',
+  anthropicModel:       'claude-sonnet-4-6',
+  threadContextMsgs:    15,
+  sentLookbackDays:     7,
 };
 
 const LABEL_NAMES = {
@@ -165,6 +171,13 @@ const LABEL_NAMES = {
 };
 const ALL_NUMBERED_LABELS = Object.values(LABEL_NAMES);
 
+// Chase thresholds by contact type (days of silence before drafting a follow-up)
+const CHASE_DAYS = {
+  assistant: 3,  // admin staff / personal assistants
+  business:  5,  // agents, suppliers, business partners
+  legal:     7,  // solicitors, councils, formal authorities
+};
+
 
 // =============================================================================
 // ENTRY POINTS
@@ -174,6 +187,7 @@ function runAllLoops() {
   try { runIncomingLoop_();       } catch (e) { Logger.log('Incoming loop error: ' + e);        }
   try { runReplyReceivedLoop_();  } catch (e) { Logger.log('Reply-received loop error: ' + e);  }
   try { runSentLoop_();           } catch (e) { Logger.log('Sent loop error: ' + e);             }
+  try { runChaseLoop_();          } catch (e) { Logger.log('Chase loop error: ' + e);            }
 }
 
 function setupTrigger() {
@@ -208,12 +222,31 @@ function runIncomingLoop_() {
     const subject = thread.getFirstMessageSubject();
     const snippet = firstMsg.getPlainBody().replace(/\s+/g, ' ').trim().substring(0, 600);
 
+    // 1. Rule-based filing check (no LLM)
+    const ruleFilingKeyword = checkFilingRules_(from, subject);
+
+    // 2. Known-sender label check (no LLM) — covers high-confidence domains
     const knownLabel = checkKnownSenderLabel_(from);
-    const label = knownLabel !== null ? knownLabel : classifyIncoming_(from, subject, snippet);
+
+    let label, forward, draft;
+
+    if (knownLabel !== null) {
+      // High-confidence domain: skip label Nano, but still check if directed at you before drafting
+      label   = knownLabel;
+      forward = ruleFilingKeyword;
+      draft   = knownLabel === 1 ? isDirectedAtYou_(from, subject, snippet) : false;
+    } else {
+      // Unknown sender: call Nano for label + forward + draft in one shot
+      const result = classifyIncoming_(from, subject, snippet, ruleFilingKeyword);
+      label   = result.label;
+      forward = result.forward;
+      draft   = result.draft;
+    }
 
     applyNumberedLabel_(thread, label);
+    if (forward && CFG.forwardingAddress) createForwardDraft_(thread, firstMsg, forward);
 
-    if (label === 1 && draftsCreated < CFG.draftsPerRunCap) {
+    if (label === 1 && draft && draftsCreated < CFG.draftsPerRunCap) {
       createReplyDraft_(thread);
       draftsCreated++;
     }
@@ -234,22 +267,85 @@ function checkKnownSenderLabel_(from) {
     : null;
 }
 
-// Calls GPT-4.1 Nano → label 1 or 2
-function classifyIncoming_(from, subject, snippet) {
+// Returns 'filing' or null using rule-based lookup — no LLM
+function checkFilingRules_(from, subject) {
+  if (!CFG.forwardingAddress) return null;
+
+  const domainMatch = from.match(/@([\w.-]+)/);
+  const domain  = domainMatch ? domainMatch[1].toLowerCase() : '';
+  const fromLow = from.toLowerCase();
+
+  // Never-file list overrides everything
+  for (const d of NEVER_FILE_DOMAINS) {
+    if (domain.includes(d) || fromLow.includes(d)) return null;
+  }
+
+  for (const [key, kw] of Object.entries(FILING_SENDER_MAP)) {
+    if (domain.includes(key) || fromLow.includes(key)) return kw;
+  }
+
+  const subjectLow = subject.toLowerCase();
+  for (const { match, keyword } of FILING_SUBJECT_PATTERNS) {
+    if (subjectLow.includes(match.toLowerCase())) return keyword;
+  }
+
+  return null;
+}
+
+// Calls GPT-4.1 Nano → {label: 1|2, forward: 'filing'|null, draft: true|false}
+function classifyIncoming_(from, subject, snippet, knownFilingKeyword) {
   const systemPrompt =
     `You classify incoming emails and decide whether they need a personal reply.\n\n` +
     `LABEL 1: ${LABEL_1_DEFINITION}\n\n` +
     `LABEL 2: ${LABEL_2_DEFINITION}\n\n` +
     `RULES: ${LABEL_NOTES}\n\n` +
-    `Respond with ONLY valid JSON: {"label": 1 or 2}`;
+    (CFG.forwardingAddress
+      ? `FORWARD FOR FILING: Set "forward" to "filing" if the email is a financial document, ` +
+        `invoice, statement, legal document, or operational notice. Set to null otherwise.\n` +
+        (knownFilingKeyword ? `NOTE: filing already confirmed by rule — set "forward": "${knownFilingKeyword}".\n` : '')
+      : '') +
+    `\nDRAFT REPLY: Set "draft" to true only if the email is directly addressed to you or clearly ` +
+    `requires your personal input or decision — even if you are in CC. ` +
+    `Set "draft" to false if you are merely copied on an exchange between other parties ` +
+    `and the content does not ask for your input. When uncertain, default to true.\n` +
+    `\nRespond with ONLY valid JSON: {"label": 1 or 2, "forward": "filing" or null, "draft": true or false}`;
 
   try {
     const result = callNano_(systemPrompt, `From: ${from}\nSubject: ${subject}\nBody preview: ${snippet}`);
-    return result.label === 1 ? 1 : 2;
+    return {
+      label:   result.label === 1 ? 1 : 2,
+      forward: knownFilingKeyword || (result.forward === 'filing' ? 'filing' : null),
+      draft:   result.draft !== false,
+    };
   } catch (e) {
     Logger.log('Classifier error (defaulting to label 2): ' + e);
-    return 2;
+    return { label: 2, forward: knownFilingKeyword || null, draft: false };
   }
+}
+
+// Quick Nano check: is this email actually directed at you (not just a CC)?
+function isDirectedAtYou_(from, subject, snippet) {
+  const systemPrompt =
+    `You decide whether an email requires a personal reply from the recipient.\n\n` +
+    `Answer true if the email is directly addressed to them or clearly asks for their input ` +
+    `or decision — even if they are in CC.\n` +
+    `Answer false if they are merely copied on an exchange between other parties (e.g. an assistant ` +
+    `emailing a contractor, a group thread where someone else is the primary recipient) and nothing ` +
+    `in the email asks for their personal response.\n` +
+    `When uncertain, answer true.\n\n` +
+    `Respond with ONLY valid JSON: {"directed": true or false}`;
+  try {
+    const result = callNano_(systemPrompt, `From: ${from}\nSubject: ${subject}\nBody preview: ${snippet}`);
+    return result.directed !== false;
+  } catch (e) {
+    Logger.log('isDirectedAtYou_ error (defaulting to true): ' + e);
+    return true;
+  }
+}
+
+function createForwardDraft_(thread, firstMsg, keyword) {
+  const body = keyword + '\n\n' + firstMsg.getPlainBody().substring(0, 3000);
+  GmailApp.createDraft(CFG.forwardingAddress, thread.getFirstMessageSubject(), body);
 }
 
 function createReplyDraft_(thread) {
@@ -284,7 +380,9 @@ function buildThreadContext_(msgs) {
 // =============================================================================
 // REPLY-RECEIVED LOOP
 // Watches "6: awaiting reply" threads. When the other party replies, flips
-// the thread back to "1: to respond" and creates a new reply draft.
+// the thread back to "1: to respond" and optionally creates a reply draft.
+// No LLM call — if the last message is not from you, it definitionally
+// needs your attention.
 // =============================================================================
 
 function runReplyReceivedLoop_() {
@@ -378,6 +476,104 @@ function markSentProcessed_(existingSet, newIds) {
   newIds.forEach(id => existingSet.add(id));
   const arr = Array.from(existingSet).slice(-300);
   PropertiesService.getScriptProperties().setProperty('PROCESSED_SENT_IDS', JSON.stringify(arr));
+}
+
+
+// =============================================================================
+// CHASE LOOP
+// Watches "6: awaiting reply" threads where the last message is still from
+// you. If no reply has arrived after N days (3/5/7 depending on contact
+// type), drafts a short polite follow-up. Each thread is chased at most once
+// per threshold window (tracked in Script Properties).
+// =============================================================================
+
+function runChaseLoop_() {
+  const label6 = GmailApp.getUserLabelByName(LABEL_NAMES[6]);
+  if (!label6) return;
+
+  const userEmail   = Session.getActiveUser().getEmail();
+  const threads     = label6.getThreads(0, 50);
+  const chasedMap   = getChasedThreads_();
+  const now         = Date.now();
+  let draftsCreated = 0;
+
+  for (const thread of threads) {
+    if (draftsCreated >= CFG.chaseDraftsPerRunCap) break;
+
+    const msgs    = thread.getMessages();
+    const lastMsg = msgs[msgs.length - 1];
+
+    // Only chase if your message is still the last one (truly awaiting reply)
+    if (!lastMsg.getFrom().includes(userEmail)) continue;
+
+    const lastSentMs  = lastMsg.getDate().getTime();
+    const contactType = classifyContactType_(msgs);
+    const thresholdMs = (CHASE_DAYS[contactType] || 5) * 86400000;
+
+    if ((now - lastSentMs) < thresholdMs) continue;
+
+    // Skip if already chased within the same threshold window
+    const lastChased = chasedMap[thread.getId()];
+    if (lastChased && (now - lastChased) < thresholdMs) continue;
+
+    createChaseDraft_(thread);
+    chasedMap[thread.getId()] = now;
+    draftsCreated++;
+    Utilities.sleep(400);
+  }
+
+  saveChasedThreads_(chasedMap);
+}
+
+function classifyContactType_(msgs) {
+  const context = buildThreadContext_(msgs.slice(-3));
+  const systemPrompt =
+    `Classify the primary contact in this email thread.\n\n` +
+    `Types:\n` +
+    `- "legal": solicitors, barristers, councils, government/regulatory authorities\n` +
+    `- "assistant": personal assistants or admin staff\n` +
+    `- "business": agents, suppliers, business partners, service providers, accountants\n\n` +
+    `Respond with ONLY valid JSON: {"type": "legal" or "assistant" or "business"}`;
+  try {
+    const result = callNano_(systemPrompt, `--- THREAD ---\n${context}`);
+    return ['legal', 'assistant', 'business'].includes(result.type) ? result.type : 'business';
+  } catch (e) {
+    Logger.log('Contact type classifier error (defaulting to business): ' + e);
+    return 'business';
+  }
+}
+
+function createChaseDraft_(thread) {
+  const msgs = thread.getMessages();
+  const context = buildThreadContext_(msgs);
+  const systemPrompt =
+    `You draft a short follow-up chase email.\n` +
+    `Write ONLY the reply body — no subject line, no metadata.\n` +
+    `Purpose: the sender has not received a reply. Draft a brief, polite nudge.\n` +
+    `Keep it to one or two lines maximum.\n` +
+    `Match the sender's style exactly as described below.\n\n` +
+    STYLE_PROFILE;
+  try {
+    const draft = callSonnet_(systemPrompt,
+      `Draft a short follow-up chase. Waiting for a reply to the last message.\n\n--- THREAD ---\n${context}`);
+    msgs[msgs.length - 1].createDraftReplyAll(draft);
+  } catch (e) {
+    Logger.log('Chase drafter error: ' + e);
+  }
+}
+
+function getChasedThreads_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('CHASED_THREAD_IDS') || '{}';
+  try { return JSON.parse(raw); } catch (_) { return {}; }
+}
+
+function saveChasedThreads_(map) {
+  // Prune entries older than 60 days
+  const cutoff = Date.now() - 60 * 86400000;
+  for (const id of Object.keys(map)) {
+    if (map[id] < cutoff) delete map[id];
+  }
+  PropertiesService.getScriptProperties().setProperty('CHASED_THREAD_IDS', JSON.stringify(map));
 }
 
 
